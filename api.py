@@ -558,3 +558,11 @@ async def validate_via_gemini(
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
+
+@app.get("/debug_profile")
+async def debug_profile():
+    return {
+        "GEMINI_USER_DATA": USER_DATA_DIR,
+        "GEMINI_PROFILE_DIR": PROFILE_DIR,
+        "HEADLESS": HEADLESS,
+    }
