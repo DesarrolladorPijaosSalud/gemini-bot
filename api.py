@@ -11,8 +11,10 @@ import io, json
 import os
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
+from datetime import datetime
+
 # ===============================
-#   CONFIGURACIÓN SELENIUM
+#   CONFIGURACIÓN / ENV
 # ===============================
 def getenv_bool(name: str, default=False) -> bool:
     v = os.getenv(name)
@@ -20,11 +22,11 @@ def getenv_bool(name: str, default=False) -> bool:
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
 
-GEMINI_URL = os.getenv("GEMINI_URL", "https://gemini.google.com/app?hl=es")
-# USER_DATA_DIR = os.getenv("GEMINI_USER_DATA", r"C:\ChromeAutomation\GeminiProfile")  # perfil dedicado
+GEMINI_URL   = os.getenv("GEMINI_URL", "https://gemini.google.com/app?hl=es")
 USER_DATA_DIR = os.getenv("GEMINI_USER_DATA", str(Path.home() / "ChromeAutomation" / "GeminiProfile"))
-PROFILE_DIR   = os.getenv("GEMINI_PROFILE_DIR", "Default")  # o "Profile 1", etc.
-HEADLESS      = getenv_bool("GEMINI_HEADLESS", False)
+PROFILE_DIR  = os.getenv("GEMINI_PROFILE_DIR", "Default")
+HEADLESS     = getenv_bool("GEMINI_HEADLESS", False)
+
 # ===============================
 #   SELENIUM (driver único)
 # ===============================
@@ -41,57 +43,102 @@ _driver = None
 _wait: Optional[WebDriverWait] = None
 _driver_lock = threading.Lock()  # serializa el acceso
 
+# Artefactos de depuración (screenshots + HTML)
+_ARTIFACTS_DIR = Path("/opt/gemini-bot/selenium_artifacts")
+_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
+def _snap(name: str):
+    """Guarda screenshot + HTML para depurar headless."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    png = _ARTIFACTS_DIR / f"{ts}_{name}.png"
+    html = _ARTIFACTS_DIR / f"{ts}_{name}.html"
+    try:
+        _driver.save_screenshot(str(png))
+    except Exception:
+        pass
+    try:
+        html.write_text(_driver.page_source)
+    except Exception:
+        pass
 
-#======================================================>Funciones <====================================================== 
+#======================================================>Funciones <======================================================
 def _init_driver_once():
     global _driver, _wait
     if _driver is not None:
         return
-    opts = webdriver.ChromeOptions()
 
-    # Carga más rápida
-    opts.set_capability("pageLoadStrategy", "eager")  # <- clave
+    opts = webdriver.ChromeOptions()
+    opts.set_capability("pageLoadStrategy", "eager")
 
     if HEADLESS:
+        # Headless Linux “fiable”
         opts.add_argument("--headless=new")
-    opts.add_argument("--use-angle=d3d11")
-    opts.add_argument("--window-size=1920,1080")
-    opts.add_argument("--disable-extensions")
+        opts.add_argument("--disable-gpu")
+        opts.add_argument("--window-size=1920,1080")
+        opts.add_argument("--force-device-scale-factor=1")
+        opts.add_argument("--disable-background-timer-throttling")
+        opts.add_argument("--disable-backgrounding-occluded-windows")
+        opts.add_argument("--disable-renderer-backgrounding")
+
+    # Quitar flag de Windows
+    # opts.add_argument("--use-angle=d3d11")  # <- NO en Linux
+
+    # Harden / sandbox
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-extensions")
     opts.add_argument("--disable-popup-blocking")
     opts.add_argument("--no-first-run")
     opts.add_argument("--no-default-browser-check")
     opts.add_experimental_option("prefs", {"safebrowsing.enabled": True})
 
+    # Menos “detectable”
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+
+    # Perfil
+    if not USER_DATA_DIR or not USER_DATA_DIR.strip():
+        raise RuntimeError("GEMINI_USER_DATA vacío. Revisa tu .env o variables de entorno.")
     Path(USER_DATA_DIR).mkdir(parents=True, exist_ok=True)
     opts.add_argument(f"--user-data-dir={USER_DATA_DIR}")
     if PROFILE_DIR:
         opts.add_argument(f"--profile-directory={PROFILE_DIR}")
 
     _driver = webdriver.Chrome(options=opts)
-    # timeouts más bajos
-    _driver.set_page_load_timeout(25)                   # 90 -> 25
-    _driver.set_script_timeout(20)                      # opcional
-    _wait = WebDriverWait(_driver, 18, poll_frequency=0.2)  # 45 -> 18
+
+    # Disfraz básico
+    try:
+        _driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    except Exception:
+        pass
+
+    # timeouts (un poco mayores en headless)
+    _driver.set_page_load_timeout(25)
+    _driver.set_script_timeout(20)
+    global _wait
+    _wait = WebDriverWait(_driver, 25, poll_frequency=0.2)
 
 # ========== Helpers UI ==========
 
-def click_if_present(xpaths, timeout=5):                # 8 -> 5
+def click_if_present(xpaths, timeout=6):
     end = time.time() + timeout
     while time.time() < end:
         for xp in xpaths:
             try:
-                el = WebDriverWait(_driver, 1.0, poll_frequency=0.15)\
+                el = WebDriverWait(_driver, 1.5, poll_frequency=0.2)\
                         .until(EC.element_to_be_clickable((By.XPATH, xp)))
-                el.click()
-                time.sleep(0.15)                        # 0.3 -> 0.15
+                _driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                try:
+                    el.click()
+                except ElementClickInterceptedException:
+                    _driver.execute_script("arguments[0].click();", el)
+                time.sleep(0.25)
                 return True
             except Exception:
                 pass
+        time.sleep(0.2)
     return False
-
 
 def handle_interstitials():
     click_if_present([
@@ -108,7 +155,6 @@ def handle_interstitials():
     ], timeout=12)
 
 def open_gemini():
-    # Sólo navegar si no estamos ya en Gemini (evita recargar pesado)
     if not (_driver.current_url.startswith("https://gemini.google.com") or
             _driver.current_url.startswith("https://aistudio.google.com")):
         _driver.get(GEMINI_URL)
@@ -121,13 +167,12 @@ def new_chat():
         "//button[contains(@aria-label,'Nueva conversación') or contains(@aria-label,'New chat')]",
         "//*[self::a or self::button][.//span[contains(.,'Nueva conversación')] or .//span[contains(.,'New chat')]]",
     ]
-    if not click_if_present(xps, timeout=6):
-        # a veces hay un botón + visible para iniciar nuevo chat
+    if not click_if_present(xps, timeout=8):
         click_if_present([
             "//button[contains(@aria-label,'Nueva')]",
             "//button[contains(@aria-label,'New')]",
-        ], timeout=3)
-    _wait.until(EC.presence_of_element_located((By.XPATH, "//div[@role='textbox' and @contenteditable='true']")))
+        ], timeout=4)
+    _wait.until(EC.element_to_be_clickable((By.XPATH, "//div[@role='textbox' and @contenteditable='true']")))
 
 def find_textbox():
     candidates = _driver.find_elements(By.XPATH, "//div[@role='textbox' and @contenteditable='true']")
@@ -139,6 +184,13 @@ def find_textbox():
             continue
     return _wait.until(EC.element_to_be_clickable((By.XPATH, "//div[@role='textbox' and @contenteditable='true']")))
 
+def ensure_composer_ready():
+    """En headless, asegúrate que la zona de escritura está visible/focalizada para que aparezcan acciones."""
+    tb = find_textbox()
+    _driver.execute_script("arguments[0].scrollIntoView({block:'center'});", tb)
+    tb.click()
+    time.sleep(0.5)
+
 def set_prompt_strict(text):
     tb = find_textbox()
     _driver.execute_script("""
@@ -149,23 +201,32 @@ def set_prompt_strict(text):
         el.dispatchEvent(new Event('change', {bubbles:true}));
         el.dispatchEvent(new KeyboardEvent('keyup', {'key':'a', bubbles:true}));
     """, tb, text)
-    time.sleep(0.1)
+    time.sleep(0.2)
 
 def click_menu_button_upload():
     selectors = [
-        "//button[contains(@aria-label,'Abrir menú de subida') or contains(@aria-label,'upload') or contains(@aria-label,'archivo')]",
+        # Variantes ES/EN y distintas UIs
+        "//button[contains(@aria-label,'Adjuntar') or contains(@aria-label,'Subir') or contains(@aria-label,'archivo') or contains(@aria-label,'Upload') or contains(@aria-label,'Attach')]",
         "//button[contains(@class,'upload-card-button')]",
-        "//mat-icon[@data-mat-icon-name='add_2']/ancestor::button",
-        "//*[self::button or self::span][.//mat-icon[@data-mat-icon-name='add_2']][1]"
+        "//button[.//mat-icon[@data-mat-icon-name='add_2']]",
+        "//*[self::button or self::span][.//mat-icon[@data-mat-icon-name='add_2']][1]",
+        "//*[@role='button' and (.//*[local-name()='svg' or name()='mat-icon'] or contains(@class,'icon'))]",
+        "//*[@data-test-id='upload-button' or @data-test-id='add-attachment']",
     ]
-    for xp in selectors:
-        try:
-            btn = _wait.until(EC.element_to_be_clickable((By.XPATH, xp)))
-            btn.click()
-            time.sleep(0.3)
-            return True
-        except Exception:
-            continue
+    end = time.time() + 12
+    while time.time() < end:
+        for xp in selectors:
+            try:
+                btn = WebDriverWait(_driver, 1.8, poll_frequency=0.2).until(
+                    EC.element_to_be_clickable((By.XPATH, xp))
+                )
+                _driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+                _driver.execute_script("arguments[0].click();", btn)  # JS click, más fiable en headless
+                time.sleep(0.6)
+                return True
+            except Exception:
+                continue
+        time.sleep(0.2)
     return False
 
 def _safe_click(el):
@@ -175,7 +236,7 @@ def _safe_click(el):
         _driver.execute_script("arguments[0].click();", el)
 
 def click_menuitem_add_files():
-    time.sleep(0.2)
+    time.sleep(0.4)
     item_xpaths = [
         "//button[@data-test-id='local-images-files-uploader-button']",
         "//button[contains(@aria-label,'Subir archivos')]",
@@ -183,24 +244,44 @@ def click_menuitem_add_files():
         "//button[contains(@aria-label,'Upload') or .//span[contains(.,'Upload')]]",
         "//button[.//mat-icon[@data-mat-icon-name='attach_file']]",
     ]
-    end = time.time() + 5
+    end = time.time() + 10
     while time.time() < end:
         for xp in item_xpaths:
             try:
-                btn = WebDriverWait(_driver, 0.8, poll_frequency=0.15)\
+                btn = WebDriverWait(_driver, 1.2, poll_frequency=0.2)\
                         .until(EC.element_to_be_clickable((By.XPATH, xp)))
                 _driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
                 _safe_click(btn)
-                time.sleep(0.15)
+                time.sleep(0.3)
                 return True
             except Exception:
                 continue
-        time.sleep(0.1)
+        time.sleep(0.2)
     return False
+
+def _query_all_file_inputs_shadow():
+    js = r"""
+    const all = [];
+    function dig(root) {
+      const iter = document.createNodeIterator(root, NodeFilter.SHOW_ELEMENT);
+      let n;
+      while (n = iter.nextNode()) {
+        if (n.tagName === 'INPUT' && n.type === 'file' && !n.disabled) all.push(n);
+        const sr = n.shadowRoot;
+        if (sr) dig(sr);
+      }
+    }
+    dig(document);
+    return all;
+    """
+    try:
+        return _driver.execute_script(js) or []
+    except Exception:
+        return []
 
 def upload_files(paths):
     # Pre: ya hicimos click en el item de menú 'Subir archivos'
-    time.sleep(0.8)
+    time.sleep(1.0)  # headless tarda un poco más
     input_xps = [
         "//input[@type='file' and not(@disabled)]",
         "//*[@role='dialog']//input[@type='file' and not(@disabled)]",
@@ -212,16 +293,45 @@ def upload_files(paths):
             break
         except Exception:
             continue
+
     if not file_input:
+        # Shadow DOM fallback
+        cands = _query_all_file_inputs_shadow()
+        if cands:
+            file_input = cands[0]
+
+    if not file_input:
+        # Último intento: refoco composer + reabrir menú
+        ensure_composer_ready()
+        if click_menu_button_upload():
+            time.sleep(0.8)
+            cands = _query_all_file_inputs_shadow()
+            if cands:
+                file_input = cands[0]
+
+    if not file_input:
+        _snap("file_input_not_found")
         raise RuntimeError("No encontré el input[type=file] tras abrir el menú.")
 
     abs_paths = [str(Path(p).resolve()) for p in paths]
     file_input.send_keys("\n".join(abs_paths))
+
     # esperar a que aparezcan chips/previews (best effort)
     try:
         _wait.until(EC.presence_of_all_elements_located((
             By.XPATH, "//*[contains(@class,'attachment') or contains(@class,'chip') or contains(@aria-label,'file')][1]"
         )))
+    except Exception:
+        pass
+
+    # >>> CERRAR el modal de adjuntar (por tu petición) <<<
+    try:
+        # ESC al elemento activo; si no, al textbox
+        try:
+            _driver.switch_to.active_element.send_keys(Keys.ESCAPE)
+        except Exception:
+            find_textbox().send_keys(Keys.ESCAPE)
+        time.sleep(0.3)
     except Exception:
         pass
 
@@ -233,10 +343,10 @@ def click_send_when_enabled() -> bool:
     ]
     for xp in send_xps:
         try:
-            btn = WebDriverWait(_driver, 5).until(EC.element_to_be_clickable((By.XPATH, xp)))
+            btn = WebDriverWait(_driver, 6).until(EC.element_to_be_clickable((By.XPATH, xp)))
             _driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-            time.sleep(0.05)
-            btn.click()
+            time.sleep(0.1)
+            _safe_click(btn)
             return True
         except Exception:
             continue
@@ -269,7 +379,7 @@ def wait_for_response(timeout=90, stable_pause=0.6) -> str:
     end = time.time() + timeout
     last = ""
     try:
-        WebDriverWait(_driver, 20).until(EC.presence_of_element_located((
+        WebDriverWait(_driver, 25).until(EC.presence_of_element_located((
             By.XPATH, "//message-content[contains(@class,'model-response-text')]"
         )))
     except Exception:
@@ -302,7 +412,6 @@ def extract_first_json(s: str) -> Optional[dict]:
                         pass
     return None
 
-
 # ========= Prompt base (1 XML + 1 PDF) =========
 PROMPT_UNITARIO = """
 Recibirás DOS archivos: un XML (DIAN Colombia) y su PDF. Devuelve SOLO un JSON válido sin texto extra:
@@ -315,63 +424,55 @@ Si el XML no se entiende, devuelve:
 """
 
 def run_gemini_once(xml_path: str, pdf_path: str, categoria_original: Optional[str]) -> Tuple[Optional[dict], str]:
-    """
-    Abre chat nuevo, pega prompt, adjunta (pdf + xml), envía y lee 1 JSON.
-    Devuelve (dict_json | None, raw_text).
-    """
-    # 1) Nueva conversación
     open_gemini()
     try:
         new_chat()
     except Exception:
-        # si no hay botón de nueva conversación, seguimos en la actual
         pass
 
-    # 2) Prompt (antes y después de adjuntar, por si el compositor se recrea)
+    ensure_composer_ready()
     set_prompt_strict(PROMPT_UNITARIO)
+    ensure_composer_ready()
 
-    # 3) Abrir menú y elegir "Subir archivos"
+    # Abrir menú y elegir "Subir archivos"
     if not click_menu_button_upload():
+        _snap("upload_button_not_found")
         raise RuntimeError("No encontré botón (+) para subir archivos.")
     if not click_menuitem_add_files():
-        # plan B: atajo de teclado, si funciona en tu build
+        # Plan B: atajo de teclado (Ctrl+U)
         tb = find_textbox()
         tb.click()
         tb.send_keys(Keys.CONTROL, 'u')
-        #presionar tecla ESC para cerrar cualquier modal que haya quedado
-        tb.send_keys(Keys.ESCAPE)
-        time.sleep(0.2)
-
-    # 4) Subir en orden: PDF y XML (o viceversa; no importa para el prompt)
+        time.sleep(1.0)  # deja que emerja el picker interno
+        # (el modal se cerrará tras upload_files con ESC)
+    # Subir (PDF + XML)
     upload_files([pdf_path, xml_path])
 
-    # 5) Reforzar prompt y enviar
+    # Reforzar prompt y enviar
     set_prompt_strict(PROMPT_UNITARIO + " ")
     tb = find_textbox()
     tb.click()
     if not click_send_when_enabled():
         tb.send_keys(Keys.CONTROL, Keys.ENTER)
 
-    # 6) Esperar respuesta y parsear
-    raw = wait_for_response(timeout=90, stable_pause=0.6)
+    # Esperar respuesta y parsear
+    raw = wait_for_response(timeout=100, stable_pause=0.7)
     parsed = None
     try:
         parsed = json.loads(raw)
     except Exception:
         parsed = extract_first_json(raw)
 
-    # Validar llaves esperadas
     if isinstance(parsed, dict) and "tipo_documento" in parsed and "categoria_aplicada" in parsed:
         return parsed, raw
     return None, raw
-
 
 #======================================================>API <======================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _init_driver_once()
     try:
-        open_gemini()      # <- precarga la página y acepta interstitials una vez
+        open_gemini()  # precarga y acepta interstitials
     except Exception:
         pass
     yield
@@ -381,25 +482,7 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
 
-
 app = FastAPI(lifespan=lifespan)
-
-# @app.on_event("startup")
-# def _startup():
-#     _init_driver_once()
-
-
-# @app.on_event("shutdown")
-# def _shutdown():
-#     global _driver
-#     try:
-#         if _driver:
-#             _driver.quit()
-#     except Exception:
-#         pass
-#     _driver = None
-
-
 
 @app.post("/validate")
 async def validate(
@@ -407,7 +490,6 @@ async def validate(
     pdf: UploadFile = File(...),
     metadata: str = Form(...)
 ):
-    # Parsear metadata
     try:
         original = json.loads(metadata)
     except Exception as e:
@@ -422,11 +504,9 @@ async def validate(
         "detalle_error": None,
     }
 
-    # Leer bytes
     pdf_bytes = await pdf.read()
     xml_bytes = await xml.read()
 
-    # -------- Validar PDF --------
     try:
         if not pdf_bytes.startswith(b'%PDF'):
             raise ValueError("Not a PDF (magic missing)")
@@ -442,7 +522,6 @@ async def validate(
         })
         return result
 
-    # -------- Validar XML --------
     try:
         root = etree.fromstring(xml_bytes)
         if root is None or len(xml_bytes.strip()) == 0:
@@ -455,21 +534,12 @@ async def validate(
         })
         return result
 
-    # -------- Si todo ok --------
     result["estado"] = "Procesada"
     return result
 
-
 def transformar_categoria_error(categoria: str | None) -> str:
-    """
-    Si venía como FEV_Procesadas → FEV_Error,
-    NC_Procesadas → NC_Error,
-    ND_Procesadas → ND_Error,
-    o cualquier otra → Otros_Error
-    """
     if not categoria:
         return "Otros_Error"
-
     if categoria.startswith("FEV_"):
         return "FEV_Error"
     elif categoria.startswith("NC_"):
@@ -479,50 +549,36 @@ def transformar_categoria_error(categoria: str | None) -> str:
     else:
         return "Otros_Error"
 
-
 @app.post("/validate_via_gemini")
 async def validate_via_gemini(
     xml: UploadFile = File(...),
     pdf: UploadFile = File(...),
     metadata: str = Form(...),
 ):
-    # 0) Parse metadata original
     try:
         original = json.loads(metadata)
     except Exception as e:
         return JSONResponse({"error": f"Metadata inválida: {e}"}, status_code=400)
 
-    # result = {
-    #     **original,
-    #     "xmlFileName": xml.filename,
-    #     "pdfFileName": pdf.filename,
-    #     "estado": "Pendiente",
-    #     "categoria_aplicada": original.get("categoria_aplicada"),
-    #     "detalle_error": None,
-    #     "origen": "gemini",
-    # }
     result = {
         "tipo_documento": None,
         "categoria_aplicada": None,
     }
 
-    # 1) Guardar a disco (Selenium send_keys requiere paths absolutos)
     with tempfile.TemporaryDirectory() as tmpdir:
         xml_path = str(Path(tmpdir) / xml.filename)
         pdf_path = str(Path(tmpdir) / pdf.filename)
-        # leer y escribir
         xml_bytes = await xml.read()
         pdf_bytes = await pdf.read()
         Path(xml_path).write_bytes(xml_bytes)
         Path(pdf_path).write_bytes(pdf_bytes)
 
-        # 2) Ejecutar Selenium serializado
         with _driver_lock:
             _init_driver_once()
             try:
                 parsed, raw = run_gemini_once(xml_path, pdf_path, original.get("categoria_aplicada"))
             except Exception as e:
-                # error de automatización/UI
+                _snap("run_gemini_exception")
                 result.update({
                     "estado": "Error",
                     "categoria_aplicada": transformar_categoria_error(original.get("categoria_aplicada")),
@@ -530,30 +586,18 @@ async def validate_via_gemini(
                 })
                 return result
 
-    # 3) Construir respuesta final
     if parsed:
-        # result.update({
-        #     "estado": "Procesada",
-        #     "categoria_aplicada": parsed.get("categoria_aplicada", original.get("categoria_aplicada")),
-        #     "tipo_documento": parsed.get("tipo_documento"),
-        #     "gemini_raw": None,  # si no quieres retornar el raw
-        # })
         result.update({
             "tipo_documento": parsed.get("tipo_documento"),
             "categoria_aplicada": parsed.get("categoria_aplicada", original.get("categoria_aplicada")),
         })
     else:
         result.update({
-            # "estado": "Error",
             "tipo_documento": "Desconocido",
             "categoria_aplicada": transformar_categoria_error(original.get("categoria_aplicada")),
-            # "detalle_error": "No se pudo obtener/parsear JSON de Gemini",
-            # "gemini_raw": raw,  # útil para depurar
         })
 
     return result
-
-
 
 @app.get("/health")
 async def health_check():

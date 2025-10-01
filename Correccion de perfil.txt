@@ -1,0 +1,23 @@
+Consejos clave para este modo (perfil fijo)
+
+No ejecutes uvicorn --reload ni lances otro Chrome con ese mismo perfil: se bloquea (locks Singleton*).
+
+Si alguna vez ves “user data directory is already in use”:
+
+sudo pkill -u uranusserver -f chrome || true
+sudo pkill -u uranusserver -f chromedriver || true
+rm -f /opt/gemini-bot/ChromeAutomation/GeminiProfile/Singleton*
+sudo systemctl restart gemini-bot.service
+
+
+Si caduca el login, abre con GUI el mismo perfil:
+
+google-chrome --user-data-dir=/opt/gemini-bot/ChromeAutomation/GeminiProfile --profile-directory=Default
+
+
+inicia sesión en Gemini y cierra; luego:
+
+sudo systemctl restart gemini-bot
+
+
+¿Quieres que también lo deje detrás de Nginx con HTTPS? Te paso el bloque listo si lo necesitas.
