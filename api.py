@@ -158,6 +158,16 @@ def _init_driver_once():
     _wait = WebDriverWait(_driver, 8, poll_frequency=0.15)
 
 # ---------- UI helpers ----------
+def kill_animations():
+    _driver.execute_script("""
+      const css = `
+        * { animation-duration: 0.001s !important; transition-duration: 0.001s !important; }
+        html { scroll-behavior: auto !important; }
+      `;
+      const s = document.createElement('style'); s.textContent = css; document.documentElement.appendChild(s);
+    """)
+
+
 def _js_hide_query_all(selector: str) -> int:
     js = """
     const sel = arguments[0];
@@ -485,8 +495,10 @@ Si el XML no se entiende, devuelve:
 
 def run_gemini_once(xml_path: str, pdf_path: str, categoria_original: Optional[str]) -> Tuple[Optional[dict], str]:
     open_gemini()
+    kill_animations()
     try:
         new_chat()
+        kill_animations()
     except Exception:
         pass
 
