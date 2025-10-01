@@ -121,6 +121,80 @@ def _init_driver_once():
     _wait = WebDriverWait(_driver, 25, poll_frequency=0.2)
 
 # ========== Helpers UI ==========
+def nuke_canvas_discovery():
+    _js_hide_query_all(
+        "div[role='dialog'] img[src*='canvas_discovery_card_hero']"
+    )
+    
+def _js_hide_query_all(selector: str) -> int:
+    js = """
+    const sel = arguments[0];
+    const nodes = Array.from(document.querySelectorAll(sel));
+    for (const n of nodes) {
+      n.style.setProperty('display','none','important');
+      n.setAttribute('data-hidden-by-automation','1');
+    }
+    return nodes.length;
+    """
+    try:
+        return _driver.execute_script(js, selector) or 0
+    except Exception:
+        return 0
+
+def _dismiss_by_buttons_once() -> bool:
+    # Botones típicos de los diálogos que muestras: “No, gracias”, “Probar ahora”, “Cerrar”
+    xps = [
+        "//div[@role='dialog']//button[normalize-space()='No, gracias']",
+        "//div[@role='dialog']//button[normalize-space()='Probar ahora']",
+        "//div[@role='dialog']//button[normalize-space()='Cerrar' or @aria-label='Cerrar' or @aria-label='Close']",
+        "//div[@role='dialog']//button[normalize-space()='No thanks' or normalize-space()='Not now' or normalize-space()='Close']",
+    ]
+    for xp in xps:
+        try:
+            btn = WebDriverWait(_driver, 0.6, 0.15).until(
+                EC.element_to_be_clickable((By.XPATH, xp))
+            )
+            _driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+            try:
+                btn.click()
+            except ElementClickInterceptedException:
+                _driver.execute_script("arguments[0].click();", btn)
+            time.sleep(0.2)
+            return True
+        except Exception:
+            continue
+    return False
+
+def dismiss_gemini_modals(rounds: int = 3):
+    """
+    1) ESC al foco
+    2) Intento de click en botones conocidos
+    3) Fallback: ocultar diálogos/overlays por CSS
+    Repite pocas rondas para no bloquear.
+    """
+    for _ in range(rounds):
+        # ESC
+        try:
+            _driver.switch_to.active_element.send_keys(Keys.ESCAPE)
+        except Exception:
+            pass
+        time.sleep(0.1)
+
+        # Botones visibles
+        if _dismiss_by_buttons_once():
+            continue
+
+        # Fallback: ocultar por CSS (targets vistos en tu HTML)
+        _js_hide_query_all(",".join([
+            "div[role='dialog']",
+            ".cdk-overlay-container, .cdk-overlay-pane",
+            ".mat-dialog-container, .mat-mdc-dialog-container",
+            "[data-test-id*='discovery']",
+            "img[src*='lamda/images/discovery']",
+            "img[src*='canvas_discovery_card_hero']",
+        ]))
+        time.sleep(0.15)
+
 
 def click_if_present(xpaths, timeout=6):
     end = time.time() + timeout
@@ -161,6 +235,7 @@ def open_gemini():
         _driver.get(GEMINI_URL)
         handle_interstitials()
     _wait.until(EC.presence_of_element_located((By.XPATH, "//div[@role='textbox' and @contenteditable='true']")))
+    dismiss_gemini_modals(2)
 
 def new_chat():
     xps = [
@@ -173,7 +248,8 @@ def new_chat():
             "//button[contains(@aria-label,'Nueva')]",
             "//button[contains(@aria-label,'New')]",
         ], timeout=4)
-    _wait.until(EC.element_to_be_clickable((By.XPATH, "//div[@role='textbox' and @contenteditable='true']")))
+    _wait.until(EC.presence_of_element_located((By.XPATH, "//div[@role='textbox' and @contenteditable='true']")))
+    dismiss_gemini_modals(2)
 
 def find_textbox():
     candidates = _driver.find_elements(By.XPATH, "//div[@role='textbox' and @contenteditable='true']")
@@ -187,53 +263,61 @@ def find_textbox():
     dismiss_overlays_quick()
     return _wait.until(EC.element_to_be_clickable((By.XPATH, "//div[@role='textbox' and @contenteditable='true']")))
 
+def ensure_not_covered(element, tries=3):
+    for _ in range(tries):
+        try:
+            rect = _driver.execute_script("""
+              const el = arguments[0];
+              const r = el.getBoundingClientRect();
+              return {x: Math.floor(r.left + r.width/2), y: Math.floor(r.top + Math.min(20, r.height/2))};
+            """, element)
+            top = _driver.execute_script(
+                "return document.elementFromPoint(arguments[0], arguments[1])",
+                rect["x"], rect["y"]
+            )
+            if top is None:
+                dismiss_gemini_modals(1); time.sleep(0.2); continue
+            if top == element:
+                return True
+            # Si hay algo encima, escóndelo y reintenta
+            _driver.execute_script(
+                "arguments[0].style.setProperty('display','none','important');", top
+            )
+            time.sleep(0.15)
+        except Exception:
+            dismiss_gemini_modals(1)
+            time.sleep(0.15)
+    return False
+
 def ensure_composer_ready():
-    """Foco/scroll al composer; si algo intercepta, limpiamos overlays y reintentamos."""
     tb = find_textbox()
-    def _focus():
-        _driver.execute_script("arguments[0].scrollIntoView({block:'center'});", tb)
+    _driver.execute_script("arguments[0].scrollIntoView({block:'center'});", tb)
+    dismiss_gemini_modals(2)
+    if not ensure_not_covered(tb):
+        _driver.execute_script("arguments[0].click(); arguments[0].focus();", tb)
+    else:
         try:
             tb.click()
         except ElementClickInterceptedException:
-            # JS click como respaldo
             _driver.execute_script("arguments[0].click();", tb)
-        # fuerza foco vía JS
-        _driver.execute_script("arguments[0].focus();", tb)
-
-    try:
-        retry(3, 0.4, _focus)
-    except ElementClickInterceptedException:
-        # Caso duro: cierra overlays y reintenta una vez más
-        dismiss_overlays_quick()
-        wait_discovery_gone(3)
-        _snap("composer_intercepted")
-        _focus()
-
-    time.sleep(0.4)
+    _driver.execute_script("arguments[0].focus();", tb)
+    time.sleep(0.2)
 
 def set_prompt_strict(text):
     ensure_composer_ready()
     tb = find_textbox()
-    def _inject():
-        _driver.execute_script("""
-            const el = arguments[0];
-            el.focus();
-            el.innerText = arguments[1];
-            el.dispatchEvent(new InputEvent('input', {bubbles:true}));
-            el.dispatchEvent(new Event('change', {bubbles:true}));
-        """, tb, text)
-    try:
-        retry(3, 0.3, _inject)
-    except ElementClickInterceptedException:
-        dismiss_overlays_quick()
-        wait_discovery_gone(3)
-        _snap("inject_intercepted")
-        _inject()
+    _driver.execute_script("""
+        const el = arguments[0];
+        el.focus();
+        el.innerText = arguments[1];
+        el.dispatchEvent(new InputEvent('input', {bubbles:true}));
+        el.dispatchEvent(new Event('change', {bubbles:true}));
+    """, tb, text)
     time.sleep(0.2)
-
 
 def click_menu_button_upload():
     # Limpieza previa
+    dismiss_gemini_modals(2)
     dismiss_overlays_quick()
     wait_discovery_gone(2)
 
