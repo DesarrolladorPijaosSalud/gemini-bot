@@ -73,9 +73,7 @@ def wait_and_js_click(xp: str, timeout=WAIT_MEDIUM) -> bool:
     last_err = None
     while time.time() < end:
         try:
-            el = WebDriverWait(_driver, 1.2, 0.15).until(
-                EC.element_to_be_clickable((By.XPATH, xp))
-            )
+            el = WebDriverWait(_driver, 1.2, 0.15).until(EC.element_to_be_clickable((By.XPATH, xp)))
             _driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
             _js_click(el)
             time.sleep(CLICK_PAUSE)
@@ -240,8 +238,7 @@ def open_gemini():
     wait_ui_idle(250)
 
 def get_textbox_fast():
-    tb = _wait.until(EC.presence_of_element_located(
-        (By.XPATH, "//div[@role='textbox' and @contenteditable='true']")))
+    tb = _wait.until(EC.presence_of_element_located((By.XPATH, "//div[@role='textbox' and @contenteditable='true']")))
     _driver.execute_script("arguments[0].scrollIntoView({block:'center'});", tb)
     top = _driver.execute_script("""
         const el = arguments[0];
@@ -265,7 +262,7 @@ def clear_textbox():
       el.dispatchEvent(new Event('change',{bubbles:true}));
     """, tb)
 
-def remove_existing_attachments(max_clicks=6):
+def remove_existing_attachments(max_clicks=8):
     for _ in range(max_clicks):
         btns = _driver.find_elements(By.XPATH,
             "//button[contains(@aria-label,'Eliminar') or contains(@aria-label,'Remove') or contains(@aria-label,'Cerrar')]")
@@ -301,9 +298,24 @@ def set_prompt_fast(text):
     """, tb, text)
     time.sleep(CLICK_PAUSE)
 
-def _query_all_file_inputs_shadow():
-    js = """
-    const out=[]; (function dig(n){for(const el of n.querySelectorAll('*')){if(el.tagName==='INPUT'&&el.type==='file'&&!el.disabled)out.push(el); if(el.shadowRoot)dig(el.shadowRoot)} })(document);
+# ========== selectores nativos para subir archivos ==========
+def _query_all_file_inputs_anywhere():
+    js = r"""
+    const out = [];
+    function dig(root) {
+      try {
+        const it = document.createNodeIterator(root, NodeFilter.SHOW_ELEMENT);
+        let n;
+        while (n = it.nextNode()) {
+          if (n.tagName === 'INPUT' && n.type === 'file' && !n.disabled) out.push(n);
+          if (n.shadowRoot) dig(n.shadowRoot);
+        }
+      } catch (e) {}
+    }
+    dig(document);
+    for (const f of Array.from(document.querySelectorAll('iframe'))) {
+      try { if (f.contentDocument) dig(f.contentDocument); } catch(e) {}
+    }
     return out;
     """
     try:
@@ -311,59 +323,96 @@ def _query_all_file_inputs_shadow():
     except Exception:
         return []
 
-def open_attach_menu_fast() -> bool:
-    # 1) Atajo directo (lo más robusto)
-    try:
-        tb = get_textbox_fast()
-        _driver.execute_script("arguments[0].focus();", tb)
-        tb.send_keys(Keys.CONTROL, 'u')
-        time.sleep(0.3)
-        return True
-    except Exception:
-        pass
-    # 2) Fallback: botón “+ / Adjuntar”
+def open_upload_menu_native(timeout=3.0) -> bool:
+    dismiss_gemini_modals(1)
+    dismiss_overlays_quick()
+    plus_xps = [
+        "//button[contains(@class,'upload-card-button')][.//mat-icon[@data-mat-icon-name='add_2']]",
+        "//button[contains(@aria-label,'Adjuntar') or contains(@aria-label,'archivo') or contains(@aria-label,'Upload')]",
+    ]
+    end = time.time() + timeout
+    while time.time() < end:
+        for xp in plus_xps:
+            try:
+                btn = WebDriverWait(_driver, 1.2, 0.15).until(EC.element_to_be_clickable((By.XPATH, xp)))
+                _driver.execute_script("arguments[0].scrollIntoView({block:'center'}); arguments[0].click();", btn)
+                WebDriverWait(_driver, 1.0, 0.1).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "mat-card[data-test-id='upload-file-card-container']"))
+                )
+                time.sleep(0.15)
+                return True
+            except Exception:
+                continue
+        time.sleep(0.15)
+    return False
+
+def click_menuitem_subir_archivos(timeout=2.5) -> bool:
+    item_xps = [
+        "//mat-card[@data-test-id='upload-file-card-container']//button[@data-test-id='local-images-files-uploader-button']",
+        "//button[contains(@aria-label,'Subir archivos') or contains(.,'Subir archivos') or contains(.,'Upload files')]",
+        "//button[.//mat-icon[@data-mat-icon-name='attach_file']]",
+    ]
+    end = time.time() + timeout
+    while time.time() < end:
+        for xp in item_xps:
+            try:
+                el = WebDriverWait(_driver, 1.0, 0.15).until(EC.element_to_be_clickable((By.XPATH, xp)))
+                _driver.execute_script("arguments[0].scrollIntoView({block:'center'}); arguments[0].click();", el)
+                time.sleep(0.15)
+                return True
+            except Exception:
+                continue
+        time.sleep(0.1)
+    return False
+
+def close_upload_menu_native():
     xps = [
-        "//button[contains(@aria-label,'Adjuntar') or contains(@aria-label,'Upload') or contains(@aria-label,'archivo')]",
-        "//button[contains(@class,'upload-card-button')]",
-        "//button[.//mat-icon[@data-mat-icon-name='add_2']]",
+        "//button[contains(@class,'upload-card-button') and contains(@class,'close')]",
+        "//button[contains(@class,'upload-card-button')][.//mat-icon[@data-mat-icon-name='add_2']]",
     ]
     for xp in xps:
         try:
-            el = WebDriverWait(_driver, 1.2, 0.15).until(EC.element_to_be_clickable((By.XPATH, xp)))
-            _driver.execute_script("arguments[0].scrollIntoView({block:'center'}); arguments[0].click();", el)
-            time.sleep(0.25)
+            btn = WebDriverWait(_driver, 0.8, 0.1).until(EC.element_to_be_clickable((By.XPATH, xp)))
+            _driver.execute_script("arguments[0].click();", btn)
+            time.sleep(0.1)
             return True
         except Exception:
             continue
-    return False
-
-def upload_files(paths):
-    # Asegura que el menú esté abierto
-    if not open_attach_menu_fast():
-        raise RuntimeError("No pude abrir el selector de archivos")
-
-    time.sleep(0.3)
-    inputs = _query_all_file_inputs_shadow()
-    if not inputs:
-        time.sleep(0.4)
-        inputs = _query_all_file_inputs_shadow()
-
-    if not inputs:
-        _snap("file_input_not_found_fast")
-        raise RuntimeError("No encontré input[type=file]")
-
-    abs_paths = [str(Path(p).resolve()) for p in paths]
-    try:
-        inputs[0].send_keys("\n".join(abs_paths))
-    except Exception:
-        _driver.execute_script("arguments[0].style.display='block';", inputs[0])
-        inputs[0].send_keys("\n".join(abs_paths))
-
-    # cierra el modal con ESC para volver al compositor
     try:
         _driver.switch_to.active_element.send_keys(Keys.ESCAPE)
     except Exception:
         pass
+    return False
+
+def upload_files(paths):
+    # Abre menú nativo y pulsa "Subir archivos" hasta que exista un <input type=file>
+    for _ in range(5):
+        opened = open_upload_menu_native()
+        if opened:
+            click_menuitem_subir_archivos()
+            time.sleep(0.25)
+
+        inputs = _query_all_file_inputs_anywhere()
+        if inputs:
+            abs_paths = [str(Path(p).resolve()) for p in paths]
+            try:
+                inputs[0].send_keys("\n".join(abs_paths))
+            except Exception:
+                try:
+                    _driver.execute_script("arguments[0].style.display='block';", inputs[0])
+                    inputs[0].send_keys("\n".join(abs_paths))
+                except Exception:
+                    pass
+
+            close_upload_menu_native()
+            return
+
+        dismiss_gemini_modals(1)
+        dismiss_overlays_quick()
+        time.sleep(0.25)
+
+    _snap("file_input_not_found_native_retry_exhausted")
+    raise RuntimeError("No encontré input[type=file]")
 
 def click_send_when_enabled() -> bool:
     send_xps = [
@@ -438,10 +487,8 @@ def extract_first_json(s: str) -> Optional[dict]:
                 stack -= 1
                 if stack == 0 and start != -1:
                     cand = s[start:i+1]
-                    try:
-                        return _json.loads(cand)
-                    except Exception:
-                        pass
+                    try: return _json.loads(cand)
+                    except Exception: pass
     return None
 
 # ========= Prompt base =========
@@ -464,7 +511,7 @@ def run_gemini_once(xml_path: str, pdf_path: str, categoria_original: Optional[s
     # Prompt
     set_prompt_fast(PROMPT_UNITARIO)
 
-    # Adjuntar (Ctrl+U -> <input file>)
+    # Adjuntar usando menú nativo
     upload_files([pdf_path, xml_path])
 
     # Reforzar prompt y enviar
