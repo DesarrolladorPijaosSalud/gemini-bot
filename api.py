@@ -32,7 +32,7 @@ IMPLICIT_WAIT = 0.0
 WAIT_SHORT    = 0.8
 WAIT_MEDIUM   = 3.0
 CLICK_PAUSE   = 0.08
-
+SINGLE_CHAT = True
 # ===============================
 #   SELENIUM (driver único)
 # ===============================
@@ -99,6 +99,43 @@ def wait_ui_idle(max_ms=600):
         _driver.execute_async_script(script, int(max_ms))
     except Exception:
         time.sleep(min(max_ms, 200)/1000.0)
+
+
+def clear_textbox():
+    tb = _wait.until(EC.presence_of_element_located((By.XPATH, "//div[@role='textbox' and @contenteditable='true']")))
+    _driver.execute_script("""
+      const el = arguments[0];
+      el.focus();
+      const r = document.createRange(); r.selectNodeContents(el);
+      const s = getSelection(); s.removeAllRanges(); s.addRange(r);
+      document.execCommand('delete');
+      el.dispatchEvent(new InputEvent('input',{bubbles:true}));
+      el.dispatchEvent(new Event('change',{bubbles:true}));
+    """, tb)
+
+def remove_existing_attachments(max_clicks=6):
+    for _ in range(max_clicks):
+        btns = _driver.find_elements(By.XPATH,
+            "//button[contains(@aria-label,'Eliminar') or contains(@aria-label,'Remove') or contains(@aria-label,'Cerrar')]")
+        if not btns: break
+        _driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btns[0])
+        try: btns[0].click()
+        except Exception: _driver.execute_script("arguments[0].click();", btns[0])
+
+def reset_composer_state_full():
+    # ESC + click en body para cerrar cualquier overlay
+    try: _driver.switch_to.active_element.send_keys(Keys.ESCAPE)
+    except Exception: pass
+    _driver.execute_script("try{document.body.click()}catch(e){}")
+
+    # limpia chips y texto
+    remove_existing_attachments()
+    clear_textbox()
+
+    # ESC extra por si quedó modal de “Subir archivos”
+    try: _driver.switch_to.active_element.send_keys(Keys.ESCAPE)
+    except Exception: pass
+
 
 # ====================================================== Funciones
 def _init_driver_once():
@@ -368,28 +405,51 @@ def click_menuitem_add_files():
         return False
 
 def _query_all_file_inputs_shadow():
-    js = r"""
-    const all = [];
-    function dig(root) {
-      const it = document.createNodeIterator(root, NodeFilter.SHOW_ELEMENT);
-      let n; while(n = it.nextNode()){
-        if (n.tagName === 'INPUT' && n.type === 'file' && !n.disabled) all.push(n);
-        if (n.shadowRoot) dig(n.shadowRoot);
-      }
-    }
-    dig(document);
-    return all;
+    js = """
+    const out=[]; (function dig(n){for(const el of n.querySelectorAll('*')){if(el.tagName==='INPUT'&&el.type==='file'&&!el.disabled)out.push(el); if(el.shadowRoot)dig(el.shadowRoot)} })(document);
+    return out;
     """
     try: return _driver.execute_script(js) or []
     except Exception: return []
 
+
+def open_attach_menu_fast() -> bool:
+    # 1) Atajo directo (lo más robusto)
+    try:
+        tb = _wait.until(EC.presence_of_element_located((By.XPATH, "//div[@role='textbox' and @contenteditable='true']")))
+        _driver.execute_script("arguments[0].focus();", tb)
+        tb.send_keys(Keys.CONTROL, 'u')
+        time.sleep(0.3)
+        return True
+    except Exception:
+        pass
+
+    # 2) Fallback: botón “+ / Adjuntar”
+    xps = [
+        "//button[contains(@aria-label,'Adjuntar') or contains(@aria-label,'Upload') or contains(@aria-label,'archivo')]",
+        "//button[contains(@class,'upload-card-button')]",
+        "//button[.//mat-icon[@data-mat-icon-name='add_2']]",
+    ]
+    for xp in xps:
+        try:
+            el = WebDriverWait(_driver, 1.2, 0.15).until(EC.element_to_be_clickable((By.XPATH, xp)))
+            _driver.execute_script("arguments[0].scrollIntoView({block:'center'}); arguments[0].click();", el)
+            time.sleep(0.25)
+            return True
+        except Exception:
+            continue
+    return False
+
 def upload_files(paths):
-    wait_ui_idle(300)
+    # Asegura que el menú esté abierto
+    if not open_attach_menu_fast():
+        raise RuntimeError("No pude abrir el selector de archivos")
+
+    time.sleep(0.3)
     inputs = _query_all_file_inputs_shadow()
     if not inputs:
-        click_menu_button_upload()
-        click_menuitem_add_files()
-        wait_ui_idle(300)
+        # algunos builds tardan un poco en inyectar el <input>
+        time.sleep(0.4)
         inputs = _query_all_file_inputs_shadow()
 
     if not inputs:
@@ -400,15 +460,13 @@ def upload_files(paths):
     try:
         inputs[0].send_keys("\n".join(abs_paths))
     except Exception:
+        # asegúrate de que no esté display:none
         _driver.execute_script("arguments[0].style.display='block';", inputs[0])
         inputs[0].send_keys("\n".join(abs_paths))
 
-    # cerrar diálogo con ESC (rápido)
-    try:
-        _driver.switch_to.active_element.send_keys(Keys.ESCAPE)
-    except Exception:
-        pass
-
+    # cierra el modal con ESC para volver al compositor
+    try: _driver.switch_to.active_element.send_keys(Keys.ESCAPE)
+    except Exception: pass
 def click_send_when_enabled() -> bool:
     send_xps = [
         "//button[contains(@aria-label,'Enviar') and not(@disabled)]",
@@ -482,6 +540,36 @@ def extract_first_json(s: str) -> Optional[dict]:
                     except Exception: pass
     return None
 
+
+def run_gemini_once(xml_path: str, pdf_path: str, categoria_original: Optional[str]) -> Tuple[Optional[dict], str]:
+    open_gemini()                 # entra a la app si no estás
+    # NO new_chat: 1 solo chat estable
+    reset_composer_state_full()   # deja el compositor limpio
+
+    # Prompt
+    set_prompt_fast(PROMPT_UNITARIO)
+
+    # Adjuntar (Ctrl+U -> <input file>)
+    upload_files([pdf_path, xml_path])
+
+    # Reforzar prompt y enviar
+    set_prompt_fast(PROMPT_UNITARIO + " ")
+    tb = _wait.until(EC.presence_of_element_located((By.XPATH, "//div[@role='textbox' and @contenteditable='true']")))
+    try: tb.click()
+    except Exception: _driver.execute_script("arguments[0].click();", tb)
+
+    if not click_send_when_enabled():
+        tb.send_keys(Keys.CONTROL, Keys.ENTER)
+
+    raw = wait_for_response(timeout=90, stable_pause=0.6)
+
+    parsed = None
+    try: parsed = json.loads(raw)
+    except Exception: parsed = extract_first_json(raw)
+
+    if isinstance(parsed, dict) and "tipo_documento" in parsed and "categoria_aplicada" in parsed:
+        return parsed, raw
+    return None, raw
 # ========= Prompt base =========
 PROMPT_UNITARIO = """
 Recibirás DOS archivos: un XML (DIAN Colombia) y su PDF. Devuelve SOLO un JSON válido sin texto extra:
@@ -493,48 +581,58 @@ Si el XML no se entiende, devuelve:
 {"tipo_documento":"Desconocido","categoria_aplicada":"Otros_Error"}
 """
 
-def run_gemini_once(xml_path: str, pdf_path: str, categoria_original: Optional[str]) -> Tuple[Optional[dict], str]:
-    open_gemini()
-    kill_animations()
+def _init_driver_once():
+    global _driver, _wait
+    if _driver is not None:
+        return
+
+    opts = webdriver.ChromeOptions()
+    opts.set_capability("pageLoadStrategy", "eager")
+
+    if HEADLESS:
+        opts.add_argument("--headless=new")
+        opts.add_argument("--disable-gpu")
+    # Ventana grande ayuda a que nada tape los botones
+    opts.add_argument("--window-size=1920,1080")
+
+    # Estabilidad Linux / contenedores
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-extensions")
+    opts.add_argument("--disable-popup-blocking")
+    opts.add_argument("--no-first-run")
+    opts.add_argument("--no-default-browser-check")
+    opts.add_experimental_option("prefs", {"safebrowsing.enabled": True})
+
+    # Menos “detectable”
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+
+    # Perfil logueado
+    if not USER_DATA_DIR or not USER_DATA_DIR.strip():
+        raise RuntimeError("GEMINI_USER_DATA vacío. Revisa .env")
+    Path(USER_DATA_DIR).mkdir(parents=True, exist_ok=True)
+    opts.add_argument(f"--user-data-dir={USER_DATA_DIR}")
+    if PROFILE_DIR:
+        opts.add_argument(f"--profile-directory={PROFILE_DIR}")
+
+    _driver = webdriver.Chrome(options=opts)
+    _driver.implicitly_wait(0)               # TODO explícito
+    _driver.set_page_load_timeout(18)
+    _driver.set_script_timeout(12)
+    _wait = WebDriverWait(_driver, 7, poll_frequency=0.15)
+
+    # Disfraz + UI sin animaciones
     try:
-        new_chat()
-        kill_animations()
+        _driver.execute_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+        _driver.execute_cdp_cmd("Emulation.setIdleOverride",
+                                {"isUserActive": True, "isScreenUnlocked": True})
+        _driver.execute_cdp_cmd("Emulation.setEmulatedMedia",
+                                {"features":[{"name":"prefers-reduced-motion","value":"reduce"}]})
     except Exception:
         pass
 
-    dismiss_overlays_quick()
-    set_prompt_fast(PROMPT_UNITARIO)
-
-    if not click_menu_button_upload():
-        _snap("upload_button_not_found")
-        raise RuntimeError("No encontré botón (+) para subir archivos.")
-    if not click_menuitem_add_files():
-        _snap("upload_menu_fail")
-        raise RuntimeError("No se pudo abrir 'Subir archivos'.")
-
-    upload_files([pdf_path, xml_path])
-
-    # reforzar prompt y enviar
-    set_prompt_fast(PROMPT_UNITARIO + " ")
-    tb = get_textbox_fast()
-    try:
-        _js_click(tb)  # foco
-    except Exception:
-        pass
-
-    if not click_send_when_enabled():
-        tb.send_keys(Keys.CONTROL, Keys.ENTER)
-
-    raw = wait_for_response(timeout=100, stable_pause=0.7)
-    parsed = None
-    try:
-        parsed = json.loads(raw)
-    except Exception:
-        parsed = extract_first_json(raw)
-
-    if isinstance(parsed, dict) and "tipo_documento" in parsed and "categoria_aplicada" in parsed:
-        return parsed, raw
-    return None, raw
 
 #======================================================> API
 @asynccontextmanager
