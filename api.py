@@ -38,7 +38,8 @@ from selenium.common.exceptions import (
 )
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.common.exceptions import ElementClickInterceptedException, TimeoutException
 _driver = None
 _wait: Optional[WebDriverWait] = None
 _driver_lock = threading.Lock()  # serializa el acceso
@@ -182,30 +183,61 @@ def find_textbox():
                 return el
         except StaleElementReferenceException:
             continue
+    # limpieza si no encontró visibles
+    dismiss_overlays_quick()
     return _wait.until(EC.element_to_be_clickable((By.XPATH, "//div[@role='textbox' and @contenteditable='true']")))
 
 def ensure_composer_ready():
-    """En headless, asegúrate que la zona de escritura está visible/focalizada para que aparezcan acciones."""
+    """Foco/scroll al composer; si algo intercepta, limpiamos overlays y reintentamos."""
     tb = find_textbox()
-    _driver.execute_script("arguments[0].scrollIntoView({block:'center'});", tb)
-    tb.click()
-    time.sleep(0.5)
+    def _focus():
+        _driver.execute_script("arguments[0].scrollIntoView({block:'center'});", tb)
+        try:
+            tb.click()
+        except ElementClickInterceptedException:
+            # JS click como respaldo
+            _driver.execute_script("arguments[0].click();", tb)
+        # fuerza foco vía JS
+        _driver.execute_script("arguments[0].focus();", tb)
+
+    try:
+        retry(3, 0.4, _focus)
+    except ElementClickInterceptedException:
+        # Caso duro: cierra overlays y reintenta una vez más
+        dismiss_overlays_quick()
+        wait_discovery_gone(3)
+        _snap("composer_intercepted")
+        _focus()
+
+    time.sleep(0.4)
 
 def set_prompt_strict(text):
+    ensure_composer_ready()
     tb = find_textbox()
-    _driver.execute_script("""
-        const el = arguments[0];
-        el.focus();
-        el.innerText = arguments[1];
-        el.dispatchEvent(new InputEvent('input', {bubbles:true}));
-        el.dispatchEvent(new Event('change', {bubbles:true}));
-        el.dispatchEvent(new KeyboardEvent('keyup', {'key':'a', bubbles:true}));
-    """, tb, text)
+    def _inject():
+        _driver.execute_script("""
+            const el = arguments[0];
+            el.focus();
+            el.innerText = arguments[1];
+            el.dispatchEvent(new InputEvent('input', {bubbles:true}));
+            el.dispatchEvent(new Event('change', {bubbles:true}));
+        """, tb, text)
+    try:
+        retry(3, 0.3, _inject)
+    except ElementClickInterceptedException:
+        dismiss_overlays_quick()
+        wait_discovery_gone(3)
+        _snap("inject_intercepted")
+        _inject()
     time.sleep(0.2)
 
+
 def click_menu_button_upload():
+    # Limpieza previa
+    dismiss_overlays_quick()
+    wait_discovery_gone(2)
+
     selectors = [
-        # Variantes ES/EN y distintas UIs
         "//button[contains(@aria-label,'Adjuntar') or contains(@aria-label,'Subir') or contains(@aria-label,'archivo') or contains(@aria-label,'Upload') or contains(@aria-label,'Attach')]",
         "//button[contains(@class,'upload-card-button')]",
         "//button[.//mat-icon[@data-mat-icon-name='add_2']]",
@@ -221,12 +253,17 @@ def click_menu_button_upload():
                     EC.element_to_be_clickable((By.XPATH, xp))
                 )
                 _driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-                _driver.execute_script("arguments[0].click();", btn)  # JS click, más fiable en headless
+                try:
+                    btn.click()
+                except ElementClickInterceptedException:
+                    _driver.execute_script("arguments[0].click();", btn)
                 time.sleep(0.6)
                 return True
             except Exception:
                 continue
-        time.sleep(0.2)
+        # si no, limpia y reintenta
+        dismiss_overlays_quick()
+        time.sleep(0.3)
     return False
 
 def _safe_click(el):
@@ -251,11 +288,16 @@ def click_menuitem_add_files():
                 btn = WebDriverWait(_driver, 1.2, poll_frequency=0.2)\
                         .until(EC.element_to_be_clickable((By.XPATH, xp)))
                 _driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-                _safe_click(btn)
+                try:
+                    btn.click()
+                except ElementClickInterceptedException:
+                    dismiss_overlays_quick()
+                    _driver.execute_script("arguments[0].click();", btn)
                 time.sleep(0.3)
                 return True
             except Exception:
                 continue
+        dismiss_overlays_quick()
         time.sleep(0.2)
     return False
 
@@ -412,6 +454,62 @@ def extract_first_json(s: str) -> Optional[dict]:
                         pass
     return None
 
+
+def retry(times, delay, func, *args, **kwargs):
+    last = None
+    for _ in range(times):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            last = e
+            time.sleep(delay)
+    raise last
+
+def dismiss_overlays_quick():
+    """Cierra overlays/chat cards que interceptan clicks: ESC, blur y oculta discovery si aparece."""
+    try:
+        # 1) ESC a lo que esté activo
+        try:
+            _driver.switch_to.active_element.send_keys(Keys.ESCAPE)
+        except Exception:
+            pass
+
+        # 2) Click en body por JS para quitar focus/overlays tontos
+        _driver.execute_script("""
+            try {
+              document.body && document.body.click();
+            } catch(e) {}
+        """)
+        time.sleep(0.2)
+
+        # 3) Si hay imágenes de 'discovery' (lamda/images/discovery), escóndelas
+        _driver.execute_script("""
+            try {
+              const imgs = Array.from(document.querySelectorAll("img[src*='lamda/images/discovery']"));
+              for (const img of imgs) {
+                const box = img.closest("[role='dialog'], .mat-dialog-container, .mat-mdc-dialog-container, .cdk-overlay-container, .cdk-overlay-pane") || img.closest("div");
+                if (box) { box.style.display = "none"; box.setAttribute("data-hidden-by-automation", "1"); }
+              }
+            } catch (e) {}
+        """)
+        time.sleep(0.2)
+    except Exception:
+        pass
+
+def wait_discovery_gone(timeout=4.0):
+    """Espera breve a que desaparezcan overlays 'discovery'."""
+    end = time.time() + timeout
+    while time.time() < end:
+        present = _driver.execute_script("""
+            const imgs = document.querySelectorAll("img[src*='lamda/images/discovery']");
+            return imgs && imgs.length > 0;
+        """)
+        if not present:
+            return True
+        time.sleep(0.2)
+    return False
+
+
 # ========= Prompt base (1 XML + 1 PDF) =========
 PROMPT_UNITARIO = """
 Recibirás DOS archivos: un XML (DIAN Colombia) y su PDF. Devuelve SOLO un JSON válido sin texto extra:
@@ -430,32 +528,42 @@ def run_gemini_once(xml_path: str, pdf_path: str, categoria_original: Optional[s
     except Exception:
         pass
 
+    dismiss_overlays_quick()      # NUEVO
     ensure_composer_ready()
     set_prompt_strict(PROMPT_UNITARIO)
+    dismiss_overlays_quick()      # NUEVO
     ensure_composer_ready()
 
     # Abrir menú y elegir "Subir archivos"
     if not click_menu_button_upload():
         _snap("upload_button_not_found")
         raise RuntimeError("No encontré botón (+) para subir archivos.")
+
     if not click_menuitem_add_files():
-        # Plan B: atajo de teclado (Ctrl+U)
+        # Plan B: Ctrl+U
         tb = find_textbox()
-        tb.click()
+        try:
+            tb.click()
+        except ElementClickInterceptedException:
+            dismiss_overlays_quick()
+            _driver.execute_script("arguments[0].click();", tb)
         tb.send_keys(Keys.CONTROL, 'u')
-        time.sleep(1.0)  # deja que emerja el picker interno
-        # (el modal se cerrará tras upload_files con ESC)
-    # Subir (PDF + XML)
+        time.sleep(1.0)
+
     upload_files([pdf_path, xml_path])
 
     # Reforzar prompt y enviar
     set_prompt_strict(PROMPT_UNITARIO + " ")
     tb = find_textbox()
-    tb.click()
+    try:
+        tb.click()
+    except ElementClickInterceptedException:
+        dismiss_overlays_quick()
+        _driver.execute_script("arguments[0].click();", tb)
+
     if not click_send_when_enabled():
         tb.send_keys(Keys.CONTROL, Keys.ENTER)
 
-    # Esperar respuesta y parsear
     raw = wait_for_response(timeout=100, stable_pause=0.7)
     parsed = None
     try:

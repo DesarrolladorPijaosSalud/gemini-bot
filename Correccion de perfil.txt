@@ -1,3 +1,206 @@
+Diccionario de comandos – gemini-bot
+Servicio systemd (arranque/parada/estado)
+
+Iniciar
+sudo systemctl start gemini-bot.service
+
+Detener
+sudo systemctl stop gemini-bot.service
+
+Reiniciar
+sudo systemctl restart gemini-bot.service
+
+Recargar unit files (tras editar el .service)
+sudo systemctl daemon-reload
+
+Habilitar al arranque
+sudo systemctl enable gemini-bot.service
+
+Deshabilitar del arranque
+sudo systemctl disable gemini-bot.service
+
+Estado actual
+sudo systemctl status gemini-bot.service --no-pager
+
+Logs en vivo
+sudo journalctl -u gemini-bot.service -f
+
+Últimos N logs
+sudo journalctl -u gemini-bot.service -n 200 --no-pager
+
+Verificar aplicación en red
+
+¿Escucha en :8000?
+ss -ltnp | grep :8000 || sudo ss -ltnp | grep :8000
+
+Ping a health
+curl http://127.0.0.1:8000/health
+
+Debug de perfil cargado
+curl http://127.0.0.1:8000/debug_profile
+
+Abrir puerto en firewall (si UFW activo)
+sudo ufw allow 8000/tcp
+sudo ufw status
+
+Operación de Chrome/Chromedriver (limpieza de sesión/perfil)
+
+Matar procesos colgados
+
+sudo pkill -u uranusserver -f chrome || true
+sudo pkill -u uranusserver -f chromedriver || true
+
+
+Limpiar locks del perfil (cuando dice “user data directory is already in use”)
+rm -f /opt/gemini-bot/ChromeAutomation/GeminiProfile/Singleton* 2>/dev/null || true
+
+Probar Chrome con el perfil (GUI en sesión con X)
+
+google-chrome \
+  --user-data-dir=/opt/gemini-bot/ChromeAutomation/GeminiProfile \
+  --profile-directory=Default \
+  --no-first-run --no-default-browser-check
+
+
+Ver si hay procesos aún vivos
+pgrep -fl chrome
+pgrep -fl chromedriver
+
+Headless vs. Xvfb (robustez del flujo de adjuntar)
+
+Usar Xvfb (recomendado para UI estable sin pantalla)
+
+Instala: sudo apt update && sudo apt install -y xvfb
+
+En el unit file (/etc/systemd/system/gemini-bot.service) usa:
+ExecStart=/usr/bin/xvfb-run -a /opt/gemini-bot/bin/start.sh
+
+En .env: GEMINI_HEADLESS=false
+
+sudo systemctl daemon-reload && sudo systemctl restart gemini-bot && sudo journalctl -u gemini-bot -f
+
+Volver a headless puro
+
+En el unit file: ExecStart=/opt/gemini-bot/bin/start.sh
+
+En .env: GEMINI_HEADLESS=true
+
+sudo systemctl daemon-reload && sudo systemctl restart gemini-bot
+
+Edición/actualización de código
+
+Parar, editar y levantar
+
+sudo systemctl stop gemini-bot
+sudo -u uranusserver nano /opt/gemini-bot/api.py
+sudo systemctl start gemini-bot
+sudo journalctl -u gemini-bot -f
+
+
+Recargar systemd si cambiaste el unit file o start.sh
+
+sudo systemctl daemon-reload
+sudo systemctl restart gemini-bot
+
+
+Probar sin systemd (en la venv)
+
+cd /opt/gemini-bot
+source .venv/bin/activate
+uvicorn api:app --host 0.0.0.0 --port 8000
+
+Variables de entorno y perfil
+
+Editar .env
+sudo -u uranusserver nano /opt/gemini-bot/.env
+
+Contenido típico
+
+GEMINI_URL=https://gemini.google.com/app?hl=es
+GEMINI_USER_DATA=/opt/gemini-bot/ChromeAutomation/GeminiProfile
+GEMINI_PROFILE_DIR=Default
+GEMINI_HEADLESS=true   # o false si usas Xvfb
+
+
+Ver qué cargó la app
+curl http://127.0.0.1:8000/debug_profile
+
+Script de arranque
+
+Ruta y permisos
+
+ls -l /opt/gemini-bot/bin/start.sh
+sudo sed -i 's/\r$//' /opt/gemini-bot/bin/start.sh   # normaliza CRLF si hace falta
+sudo chmod +x /opt/gemini-bot/bin/start.sh
+
+Dependencias del sistema (útiles para Chrome/headless)
+sudo apt update
+sudo apt install -y libnss3 libxss1 libasound2 libgbm1 libxshmfence1 \
+    fonts-liberation fonts-noto-color-emoji
+# Para Xvfb (si lo usas):
+sudo apt install -y xvfb
+
+Artefactos de depuración (screenshots/HTML)
+
+Carpeta (creada por el script):
+/opt/gemini-bot/selenium_artifacts
+
+Ver últimos artefactos
+ls -lt /opt/gemini-bot/selenium_artifacts | head
+
+Inspeccionar un fallo concreto
+Abre el .html correspondiente para ver el DOM que “vio” headless.
+
+Limpiar artefactos viejos
+sudo find /opt/gemini-bot/selenium_artifacts -type f -mtime +7 -delete
+
+Troubleshooting rápido
+
+“Connection refused” en :8000
+
+sudo systemctl status gemini-bot --no-pager
+
+sudo journalctl -u gemini-bot -n 200 --no-pager
+
+ss -ltnp | grep :8000
+
+Revisa firewalls (sudo ufw status)
+
+“user data directory is already in use”
+
+Mata procesos + borra Singleton* (ver sección Chrome).
+
+Asegúrate de que solo se inicie una instancia (no uses --reload en producción).
+
+No encuentra botón “Adjuntar” (solo headless)
+
+Prueba con Xvfb (ver sección).
+
+Revisa artefactos HTML/PNG para ajustar selectores si Google cambió algo.
+
+Permisos/propietario
+
+sudo chown -R uranusserver:uranusserver /opt/gemini-bot
+sudo chmod -R 700 /opt/gemini-bot/ChromeAutomation/GeminiProfile
+
+Comandos útiles extra
+
+Ver versiones
+
+/opt/gemini-bot/.venv/bin/uvicorn --version
+google-chrome --version
+chromedriver --version 2>/dev/null || echo "chromedriver vía Selenium Manager"
+
+
+Recrear venv (si se dañó)
+
+cd /opt/gemini-bot
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install fastapi uvicorn[standard] selenium pypdf lxml python-dotenv
+
+
 Consejos clave para este modo (perfil fijo)
 
 No ejecutes uvicorn --reload ni lances otro Chrome con ese mismo perfil: se bloquea (locks Singleton*).
@@ -18,6 +221,3 @@ google-chrome --user-data-dir=/opt/gemini-bot/ChromeAutomation/GeminiProfile --p
 inicia sesión en Gemini y cierra; luego:
 
 sudo systemctl restart gemini-bot
-
-
-¿Quieres que también lo deje detrás de Nginx con HTTPS? Te paso el bloque listo si lo necesitas.
