@@ -335,6 +335,183 @@ def extract_first_json(s: str) -> Optional[dict]:
                     except Exception:
                         pass
     return None
+# ---------- Adjuntar: rápido y nativo (Linux/Windows) ----------
+
+from selenium.common.exceptions import TimeoutException, StaleElementReferenceException, ElementNotInteractableException
+
+def _wait_for(selector: str, by_css=True, timeout=3.0, poll=0.05):
+    """Espera activa por un elemento (CSS o XPATH) con polling corto."""
+    end = time.time() + timeout
+    last_exc = None
+    while time.time() < end:
+        try:
+            if by_css:
+                el = _driver.find_element(By.CSS_SELECTOR, selector)
+            else:
+                el = _driver.find_element(By.XPATH, selector)
+            if el.is_displayed():
+                return el
+        except Exception as e:
+            last_exc = e
+        time.sleep(poll)
+    if last_exc:
+        raise last_exc
+    raise TimeoutException(f"No apareció: {selector}")
+
+def open_attach_menu_native() -> None:
+    """
+    Abre el menú de subida con el botón nativo (+ add_2) y
+    espera a que el mat-card del menú esté presente.
+    """
+    # Click al botón (+) por selectores robustos
+    btn_candidates = [
+        "button.upload-card-button",  # clase estable que muestras
+        "mat-icon[data-mat-icon-name='add_2']",
+        "button[aria-label*='Adjuntar']",
+        "button[aria-label*='Upload']",
+        "button[aria-label*='archivo']",
+    ]
+
+    clicked = False
+    for css in btn_candidates:
+        els = _driver.find_elements(By.CSS_SELECTOR, css)
+        for el in els:
+            try:
+                _driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                el.click()
+                clicked = True
+                break
+            except Exception:
+                try:
+                    _driver.execute_script("arguments[0].click();", el)
+                    clicked = True
+                    break
+                except Exception:
+                    continue
+        if clicked:
+            break
+
+    if not clicked:
+        raise RuntimeError("No encontré botón (+) para abrir el menú de subida.")
+
+    # Espera a que aparezca el contenedor del menú (sin sleeps largos)
+    _wait_for("mat-card[data-test-id='upload-file-card-container']", timeout=2.0)
+
+def click_menuitem_subir_archivos() -> None:
+    """
+    Click en la opción 'Subir archivos' del menú nativo.
+    Usa data-test-id si está disponible (lo mostraste en tu HTML).
+    """
+    # Primero intenta por data-test-id directo (más rápido y estable)
+    try:
+        btn = _wait_for("button[data-test-id='local-images-files-uploader-button']", timeout=1.2)
+        _driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+        btn.click()
+        return
+    except Exception:
+        pass
+
+    # Fallbacks por XPath/aria/ícono
+    xpaths = [
+        "//button[contains(@aria-label,'Subir archivos')]",
+        "//button[.//div[contains(normalize-space(),'Subir archivos')] or .//span[contains(normalize-space(),'Subir archivos')]]",
+        "//button[.//mat-icon[@data-mat-icon-name='attach_file']]",
+    ]
+    for xp in xpaths:
+        try:
+            el = _wait.until(EC.element_to_be_clickable((By.XPATH, xp)))
+            _driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+            try:
+                el.click()
+            except ElementClickInterceptedException:
+                _driver.execute_script("arguments[0].click();", el)
+            return
+        except Exception:
+            continue
+
+    # Trigger oculto (muy útil en Linux)
+    # En tu HTML aparece: <button class="hidden-local-file-image-selector-button" ... xapfileselectortrigger>
+    try:
+        hidden_trigger = _wait_for("button.hidden-local-file-image-selector-button", timeout=0.8)
+        _driver.execute_script("arguments[0].click();", hidden_trigger)
+        return
+    except Exception:
+        pass
+
+    raise RuntimeError("No pude hacer click en 'Subir archivos'.")
+
+def _query_file_inputs_deep() -> list:
+    """Encuentra todos los <input type='file'> incluso dentro de Shadow DOM."""
+    js = """
+    const list = [];
+    function dig(root) {
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+      let n;
+      while (n = walker.nextNode()) {
+        if (n.tagName === 'INPUT' && n.type === 'file' && !n.disabled) list.push(n);
+        if (n.shadowRoot) dig(n.shadowRoot);
+      }
+    }
+    dig(document);
+    return list;
+    """
+    try:
+        return _driver.execute_script(js) or []
+    except Exception:
+        return []
+
+def wait_file_input(timeout=3.0) -> object:
+    """
+    Espera activa por el input[type=file].
+    Reintenta porque en Linux el input se inyecta con retardo tras el click.
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        # Primero intenta dentro del card abierto
+        els = _driver.find_elements(By.CSS_SELECTOR, "mat-card[data-test-id='upload-file-card-container'] input[type='file']")
+        els = [e for e in els if e.is_displayed()]
+        if els:
+            return els[0]
+        # Fallback: búsqueda profunda (shadow roots)
+        deep = _query_file_inputs_deep()
+        if deep:
+            return deep[0]
+        time.sleep(0.05)
+    raise TimeoutException("No apareció input[type=file] tras abrir 'Subir archivos'.")
+
+def upload_files_fast(paths: list[str]) -> None:
+    """
+    Flujo completo y rápido:
+      (+) → mat-card visible → 'Subir archivos' → espera input → send_keys
+    Sin sleeps largos, con polling corto.
+    """
+    open_attach_menu_native()
+    click_menuitem_subir_archivos()
+
+    file_input = wait_file_input(timeout=3.0)
+
+    abs_paths = [str(Path(p).resolve()) for p in paths]
+    joined = "\n".join(abs_paths)
+
+    # A veces el input está display:none -> forzamos visible para evitar NotInteractable
+    try:
+        file_input.send_keys(joined)
+    except (ElementNotInteractableException, StaleElementReferenceException):
+        try:
+            _driver.execute_script("arguments[0].style.display='block'; arguments[0].style.visibility='visible';", file_input)
+            time.sleep(0.02)
+            file_input.send_keys(joined)
+        except Exception as e:
+            raise RuntimeError(f"Fallo send_keys al input[type=file]: {e!s}")
+
+    # No cierres el card a ciegas con ESC inmediatamente; deja que la UI procese.
+    # Usa una espera corta por la aparición de los chips/previews (best-effort, sin bloquear).
+    try:
+        WebDriverWait(_driver, 2.0, 0.1).until(
+            EC.presence_of_element_located((By.XPATH, "//*[contains(@class,'attachment') or contains(@class,'chip') or contains(@aria-label,'file')]"))
+        )
+    except Exception:
+        pass
 
 
 # ========= Prompt base (1 XML + 1 PDF) =========
@@ -350,51 +527,47 @@ Si el XML no se entiende, devuelve:
 
 def run_gemini_once(xml_path: str, pdf_path: str, categoria_original: Optional[str]) -> Tuple[Optional[dict], str]:
     """
-    Abre chat nuevo, pega prompt, adjunta (pdf + xml), envía y lee 1 JSON.
-    Devuelve (dict_json | None, raw_text).
+    Abre chat (si hace falta), pega prompt, adjunta (PDF + XML) con menú nativo,
+    envía y lee un JSON. Devuelve (dict_json | None, raw_text).
     """
-    # 1) Nueva conversación
+    # 1) Ir a Gemini (evita recargas innecesarias)
     open_gemini()
     try:
-        new_chat()
+        new_chat()  # si no hay botón, seguimos en el chat actual
     except Exception:
-        # si no hay botón de nueva conversación, seguimos en la actual
         pass
 
-    # 2) Prompt (antes y después de adjuntar, por si el compositor se recrea)
+    # 2) Poner el prompt (antes de adjuntar)
     set_prompt_strict(PROMPT_UNITARIO)
 
-    # 3) Abrir menú y elegir "Subir archivos"
-    if not click_menu_button_upload():
-        raise RuntimeError("No encontré botón (+) para subir archivos.")
-    if not click_menuitem_add_files():
-        # plan B: atajo de teclado, si funciona en tu build
-        tb = find_textbox()
-        tb.click()
-        tb.send_keys(Keys.CONTROL, 'u')
-        #presionar tecla ESC para cerrar cualquier modal que haya quedado
-        tb.send_keys(Keys.ESCAPE)
-        time.sleep(0.2)
+    # 3) Adjuntar usando menú nativo (sin Ctrl+U, sin sleeps largos)
+    #    -> Requiere que tengas definidas: open_attach_menu_native, click_menuitem_subir_archivos,
+    #       wait_file_input y upload_files_fast como te pasé.
+    try:
+        upload_files_fast([pdf_path, xml_path])  # abre (+) -> "Subir archivos" -> input[type=file] -> send_keys
+    except Exception as e:
+        raise RuntimeError(f"No se pudieron adjuntar los archivos: {e}")
 
-    # 4) Subir en orden: PDF y XML (o viceversa; no importa para el prompt)
-    upload_files([pdf_path, xml_path])
-
-    # 5) Reforzar prompt y enviar
+    # 4) Reforzar prompt y enviar
     set_prompt_strict(PROMPT_UNITARIO + " ")
     tb = find_textbox()
-    tb.click()
+    try:
+        tb.click()
+    except Exception:
+        _driver.execute_script("arguments[0].click();", tb)
+
     if not click_send_when_enabled():
         tb.send_keys(Keys.CONTROL, Keys.ENTER)
 
-    # 6) Esperar respuesta y parsear
+    # 5) Esperar respuesta y parsear JSON
     raw = wait_for_response(timeout=90, stable_pause=0.6)
+
     parsed = None
     try:
         parsed = json.loads(raw)
     except Exception:
         parsed = extract_first_json(raw)
 
-    # Validar llaves esperadas
     if isinstance(parsed, dict) and "tipo_documento" in parsed and "categoria_aplicada" in parsed:
         return parsed, raw
     return None, raw
